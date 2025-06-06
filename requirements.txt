@@ -1,4 +1,6 @@
 gspread
-oauth2client
 pandas
+python-dotenv
 scikit-learn
+google-auth-oauthlib
+google-auth-httplib2

@@ -1,167 +1,292 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-YouTube relevance checker: computes relevance scores on video Title, Description, and Captions,
-excluding spam topics like accommodation, festivals, villas, and music-only tracks.
+YouTube relevance analyzer: computes relevance scores based on video Title, Description,
+and Captions, and writes them back to a Google Sheet.
+Excludes spam topics like accommodation, festivals, and music-only tracks.
 """
-import time
+import logging
+import os
 import re
+import sys
+import time
 import unicodedata
+from pathlib import Path
+
 import gspread
 import pandas as pd
-from oauth2client.service_account import ServiceAccountCredentials
+from dotenv import load_dotenv
 from sklearn.feature_extraction.text import HashingVectorizer, TfidfTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# 1. Authorization
-scope = [
-    'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive'
-]
-creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
-client = gspread.authorize(creds)
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
-# 2. Normalization
+# --- Helper Functions ---
 
-def normalize(text: str) -> str:
-    """Нормализует текст: убирает диакритики, приводит к ASCII, нижнему регистру и убирает лишние пробелы"""
-    nkfd = unicodedata.normalize('NFKD', text or "")
-    cleaned = nkfd.encode('ASCII', 'ignore').decode('ASCII').lower()
-    return cleaned.strip()
-
+def normalize_text(text: str) -> str:
+    """Normalizes text: removes diacritics, converts to ASCII, lowercase, and strips whitespace."""
+    if not isinstance(text, str):
+        return ""
+    # NFKD normalization separates combined characters into base characters and diacritics
+    nkfd_form = unicodedata.normalize('NFKD', text)
+    # Encode to ASCII, ignoring characters that cannot be represented, then decode back
+    ascii_text = nkfd_form.encode('ASCII', 'ignore').decode('ASCII')
+    return ascii_text.lower().strip()
 
 def extract_first_sentence(text: str) -> str:
-    s = (text or '').replace('\n', ' ').strip() + ' '
-    m = re.match(r'(.+?[\.!?])\s', s)
-    return m.group(1) if m else s.strip()
-
+    """Extracts the first sentence from a block of text."""
+    if not isinstance(text, str):
+        return ""
+    # Replace newlines with spaces to treat text as a single block
+    cleaned_text = text.replace('\n', ' ').strip()
+    # Find the first occurrence of a sentence-ending punctuation mark
+    match = re.match(r'(.+?[.!?])', cleaned_text)
+    return match.group(1) if match else cleaned_text
 
 def colnum_to_letter(n: int) -> str:
-    s = ''
+    """Converts a 1-based column number to its letter representation (e.g., 1 -> A, 27 -> AA)."""
+    string = ""
     while n > 0:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
+        n, remainder = divmod(n - 1, 26)
+        string = chr(65 + remainder) + string
+    return string
 
-# 3. Spam filter patterns
-spam_keywords = [
-    'hotel','hôtel','resort','inn','accommodation','motel','lodge',
-    'guest house','guesthouse','bnb',
-    'apartment','apartments','studio','flat',
-    'festival','music festival','concert','festivals',
-    'villa','villas','holiday home','vacation home','bungalow'
+# --- Spam & Content Filtering ---
+
+SPAM_KEYWORDS = [
+    'hotel', 'hôtel', 'resort', 'inn', 'accommodation', 'motel', 'lodge',
+    'guest house', 'guesthouse', 'bnb',
+    'apartment', 'apartments', 'studio', 'flat',
+    'festival', 'music festival', 'concert', 'festivals',
+    'villa', 'villas', 'holiday home', 'vacation home', 'bungalow'
 ]
-spam_patterns = [re.compile(r"\b" + re.escape(k) + r"\b") for k in spam_keywords]
+SPAM_PATTERNS = [re.compile(r"\b" + re.escape(keyword) + r"\b", re.IGNORECASE) for keyword in SPAM_KEYWORDS]
 
-# 4. Music or lyrics-only detection
-def is_music_or_lyrics(capt: str) -> bool:
-    lines = [l.strip() for l in capt.split('\n') if l.strip()]
+def is_music_or_lyrics(caption_text: str) -> bool:
+    """Detects if captions seem to be only for music or lyrics."""
+    if not isinstance(caption_text, str):
+        return False
+    lines = [line.strip() for line in caption_text.split('\n') if line.strip()]
     if not lines:
         return False
-    tag_lines = sum(bool(re.match(r'^\[.*\]$', l)) for l in lines)
-    if tag_lines / len(lines) > 0.5:
+
+    # Check for a high percentage of lines that are just tags like [Music] or [Intro]
+    tag_lines = sum(1 for line in lines if re.fullmatch(r'\[.*\]', line))
+    if len(lines) > 0 and (tag_lines / len(lines)) > 0.5:
         return True
-    short_lines = sum(len(l.split()) <= 5 for l in lines)
-    return short_lines / len(lines) > 0.7
 
-# 5. Read sheet
-time_start = time.time()
-sheet = client.open_by_key('1Byt1QLFgwYs_nybswGqYOWqMzSm6DDF_jnL08GmXMZQ').worksheet('Results')
-rows = sheet.get_all_values()
-hdr, data = rows[0], rows[1:]
-df = pd.DataFrame(data, columns=hdr).fillna('').astype(str)
-df.columns = df.columns.str.strip()
-print(f"Loaded {len(df)} rows in {time.time() - time_start:.2f}s")
-
-# 6. Prepare fields
-N = len(df)
-captions = df.get('Captions', pd.Series([''] * N)).tolist()
-titles   = df.get('Title', pd.Series([''] * N)).tolist()
-descs    = df.get('Description', pd.Series([''] * N)).tolist()
-keys     = df.get('Keywords', pd.Series([''] * N)).tolist()
-first_sents = [extract_first_sentence(d) for d in descs]
-
-# Normalize text fields
-norm_titles = [normalize(t) for t in titles]
-norm_descs  = [normalize(d) for d in descs]
-norm_first  = [normalize(fs) for fs in first_sents]
-norm_caps   = [normalize(c) for c in captions]
-norm_keys   = [normalize(k.split(',')[0]) for k in keys]
-
-# 7. Filter check
-def is_spam(i: int) -> bool:
-    text = norm_titles[i] + ' ' + norm_descs[i]
-    if any(p.search(text) for p in spam_patterns):
+    # Check for a high percentage of very short lines, typical for lyrics
+    short_lines = sum(1 for line in lines if len(line.split()) <= 5)
+    if len(lines) > 0 and (short_lines / len(lines)) > 0.7:
         return True
-    if is_music_or_lyrics(captions[i]):
+
+    return False
+
+def check_spam(row: pd.Series) -> bool:
+    """Checks a single DataFrame row for spam content."""
+    # Combine normalized title and description for keyword search
+    text_to_check = f"{row['norm_title']} {row['norm_description']}"
+    if any(pattern.search(text_to_check) for pattern in SPAM_PATTERNS):
+        return True
+    if is_music_or_lyrics(row['Captions']):
         return True
     return False
 
-# 8. Relevance computation
-hv = HashingVectorizer(n_features=5000, alternate_sign=False, ngram_range=(1,2))
-tf = TfidfTransformer()
-boost = 0.1
-relevance = [0.0] * N
-groups = {}
-for i, k in enumerate(norm_keys):
-    if not k or is_spam(i):
-        continue
-    if k in norm_titles[i] or k in norm_descs[i] or k in norm_caps[i]:
-        groups.setdefault(k, []).append(i)
-for key, idxs in groups.items():
-    docs = [f"{norm_titles[i]} {norm_first[i]} {norm_caps[i]}" for i in idxs]
-    X = tf.fit_transform(hv.transform(docs))
-    Q = tf.transform(hv.transform([key] * len(idxs)))
-    sims = cosine_similarity(Q, X).ravel()
-    for i, score in zip(idxs, sims):
-        if key in norm_first[i]:
-            score = min(1.0, score + boost)
-        relevance[i] = float(score)
-print(f"Relevance done in {time.time() - time_start:.2f}s, scored {sum(1 for v in relevance if v > 0)} items")
+# --- Core Logic ---
 
-# 9. RelevanceWithoutBeach
-beach_syns = ['beach','spiaggia','strand','plaje','playa','praia']
-local_map  = {'italy':'spiaggia','germany':'strand','spain':'playa','france':'plage','portugal':'praia'}
-relevance_nb = [0.0] * N
-groups2 = {}
-for i, k in enumerate(norm_keys):
-    if not k or is_spam(i):
-        continue
-    country = normalize(df.at[i, 'Country']) if 'Country' in df else ''
-    loc = local_map.get(country, 'beach')
-    if any(s in k for s in beach_syns):
-        newk = re.sub(r'(?i)\b(?:' + '|'.join(beach_syns) + r')\b', loc, k)
+def load_config() -> dict:
+    """Loads configuration from .env file."""
+    env_path = Path('.') / '.env'
+    if not env_path.exists():
+        logger.error(f"❌ Configuration file .env not found in {env_path.resolve()}")
+        sys.exit(1)
+    load_dotenv(dotenv_path=env_path)
+    config = {
+        "sheet_id": os.getenv("SHEET_ID"),
+        "worksheet_name": os.getenv("WORKSHEET_NAME"),
+        "credentials_path": os.getenv("CREDENTIALS_JSON_PATH")
+    }
+    if not all(config.values()):
+        logger.error("❌ One or more required variables (SHEET_ID, WORKSHEET_NAME, CREDENTIALS_JSON_PATH) are missing in .env")
+        sys.exit(1)
+    return config
+
+def authorize_gspread(credentials_path: str) -> gspread.Client:
+    """Authorizes with Google Sheets API using service account credentials."""
+    logger.info("🔐 Authorizing with Google Sheets API...")
+    try:
+        return gspread.service_account(filename=credentials_path)
+    except FileNotFoundError:
+        logger.error(f"❌ Credentials file not found at: {credentials_path}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"❌ Failed to authorize: {e}")
+        sys.exit(1)
+
+def load_data(worksheet: gspread.Worksheet) -> pd.DataFrame:
+    """Loads all data from a worksheet into a pandas DataFrame."""
+    logger.info(f"⬇️ Loading data from worksheet '{worksheet.title}'...")
+    start_time = time.time()
+    try:
+        rows = worksheet.get_all_values()
+        if not rows:
+            logger.error("❌ Worksheet is empty.")
+            sys.exit(1)
+        header = [h.strip() for h in rows[0]]
+        df = pd.DataFrame(rows[1:], columns=header).fillna('').astype(str)
+        logger.info(f"✅ Loaded {len(df)} rows in {time.time() - start_time:.2f}s")
+        return df
+    except Exception as e:
+        logger.error(f"❌ Failed to load data from worksheet: {e}")
+        sys.exit(1)
+
+
+def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Applies normalization and filtering to the DataFrame."""
+    logger.info("⚙️ Pre-processing data...")
+    # Normalize text fields for analysis
+    df['norm_title'] = df['Title'].apply(normalize_text)
+    df['norm_description'] = df['Description'].apply(normalize_text)
+    df['norm_captions'] = df['Captions'].apply(normalize_text)
+    # Extract the main keyword (assuming it's the first in a comma-separated list)
+    df['norm_keyword'] = df['Keywords'].apply(lambda k: normalize_text(k.split(',')[0]))
+    # Extract the first sentence for boosted relevance scoring
+    df['first_sentence'] = df['Description'].apply(extract_first_sentence)
+    df['norm_first_sentence'] = df['first_sentence'].apply(normalize_text)
+    # Identify spam rows
+    df['is_spam'] = df.apply(check_spam, axis=1)
+    logger.info(f"🔍 Found and marked {df['is_spam'].sum()} spam rows.")
+    return df
+
+def calculate_relevance_scores(df: pd.DataFrame, keyword_modifier_func=None) -> pd.Series:
+    """
+    Calculates relevance scores for a DataFrame.
+    A keyword_modifier_func can be provided to alter keywords before comparison.
+    """
+    relevance_scores = pd.Series(0.0, index=df.index)
+    # Filter out spam and rows without a keyword
+    valid_df = df[~df['is_spam'] & (df['norm_keyword'] != '')].copy()
+
+    # Apply keyword modification if a function is provided
+    if keyword_modifier_func:
+        valid_df['modified_keyword'] = valid_df.apply(keyword_modifier_func, axis=1)
+        keyword_col = 'modified_keyword'
     else:
-        newk = f"{k} {loc}"
-    groups2.setdefault(newk, []).append(i)
-for newk, idxs in groups2.items():
-    docs = [f"{norm_titles[i]} {norm_first[i]} {norm_caps[i]}" for i in idxs]
-    X2 = tf.fit_transform(hv.transform(docs))
-    Q2 = tf.transform(hv.transform([newk] * len(idxs)))
-    sims2 = cosine_similarity(Q2, X2).ravel()
-    for i, score in zip(idxs, sims2): relevance_nb[i] = float(score)
-print(f"RelevanceWithoutBeach done in {time.time() - time_start:.2f}s, groups {len(groups2)}")
+        valid_df['modified_keyword'] = valid_df['norm_keyword']
+        keyword_col = 'norm_keyword'
 
-# 10. Write back
-time_start2 = time.time()
-if 'Relevance' not in df.columns:
-    df['Relevance'] = relevance
-else:
-    df.loc[:, 'Relevance'] = relevance
-if 'RelevanceWithoutBeach' not in df.columns:
-    df['RelevanceWithoutBeach'] = relevance_nb
-else:
-    df.loc[:, 'RelevanceWithoutBeach'] = relevance_nb
-hdr_vals = sheet.row_values(1)
-new_cols = [col for col in ['Relevance', 'RelevanceWithoutBeach'] if col not in hdr_vals]
-if new_cols:
-    total_req = len(hdr_vals) + len(new_cols)
-    if total_req > sheet.col_count:
-        sheet.add_cols(total_req - sheet.col_count)
-    for idx, col in enumerate(new_cols, start=len(hdr_vals)+1):
-        sheet.update_cell(1, idx, col)
-for col in ['Relevance','RelevanceWithoutBeach']:
-    cidx = df.columns.get_loc(col) + 1
-    rng = f"{colnum_to_letter(cidx)}2:{colnum_to_letter(cidx)}{N+1}"
-    sheet.update(rng, [[v] for v in df[col]])
-print(f"Write complete in {time.time() - time_start2:.2f}s")
+    # Group by the (potentially modified) keyword to compute TF-IDF within each group
+    grouped = valid_df.groupby(keyword_col)
+    
+    vectorizer = HashingVectorizer(n_features=5000, alternate_sign=False, ngram_range=(1, 2))
+    tfidf_transformer = TfidfTransformer()
+    
+    for keyword, group_df in grouped:
+        indices = group_df.index
+        # Create a document for each video by combining its most relevant text parts
+        docs = (group_df['norm_title'] + ' ' + group_df['norm_first_sentence'] + ' ' + group_df['norm_captions']).tolist()
+        
+        if not any(docs):  # Skip if all documents in the group are empty
+            continue
+            
+        # Fit and transform the documents within the group
+        X_docs = tfidf_transformer.fit_transform(vectorizer.transform(docs))
+        # Transform the keyword query
+        X_query = tfidf_transformer.transform(vectorizer.transform([keyword]))
+        
+        # Calculate cosine similarity
+        sim_scores = cosine_similarity(X_query, X_docs).flatten()
+        
+        # Apply a boost if the keyword appears in the first sentence
+        boost_mask = group_df['norm_first_sentence'].str.contains(re.escape(keyword), na=False)
+        sim_scores[boost_mask] = (sim_scores[boost_mask] + 0.1).clip(upper=1.0)
+        
+        # Assign scores back to the main series
+        relevance_scores.loc[indices] = sim_scores
+        
+    return relevance_scores
+
+def write_data_back(worksheet: gspread.Worksheet, df: pd.DataFrame, columns_to_write: list):
+    """Writes specified DataFrame columns back to the worksheet."""
+    logger.info(f"⬆️ Writing columns {columns_to_write} back to worksheet...")
+    start_time = time.time()
+    try:
+        header = worksheet.row_values(1)
+        # Check for and add new columns if they don't exist in the header
+        new_cols_to_add = [col for col in columns_to_write if col not in header]
+        if new_cols_to_add:
+            logger.info(f"Adding new columns to sheet: {new_cols_to_add}")
+            # Append columns to the end of the header
+            worksheet.update(f"{colnum_to_letter(len(header) + 1)}1", [[col] for col in new_cols_to_add])
+            header.extend(new_cols_to_add)
+
+        # Update each column individually
+        update_requests = []
+        for col_name in columns_to_write:
+            col_idx = header.index(col_name) + 1
+            col_letter = colnum_to_letter(col_idx)
+            range_to_update = f"{col_letter}2:{col_letter}{len(df) + 1}"
+            # Prepare data in the format gspread expects: list of lists
+            values = df[[col_name]].values.tolist()
+            update_requests.append({'range': range_to_update, 'values': values})
+        
+        if update_requests:
+            worksheet.batch_update(update_requests)
+
+        logger.info(f"✅ Write complete in {time.time() - start_time:.2f}s")
+    except Exception as e:
+        logger.error(f"❌ Failed to write data back to worksheet: {e}")
+
+
+def main():
+    """Main execution function."""
+    total_start_time = time.time()
+    
+    # 1. Load configuration and authorize
+    config = load_config()
+    gc = authorize_gspread(config['credentials_path'])
+    worksheet = gc.open_by_key(config['sheet_id']).worksheet(config['worksheet_name'])
+
+    # 2. Load and preprocess data
+    df = load_data(worksheet)
+    df = preprocess_data(df)
+
+    # 3. Calculate "Relevance" score
+    logger.info("🚀 Calculating standard 'Relevance' scores...")
+    df['Relevance'] = calculate_relevance_scores(df)
+    logger.info(f"✅ Scored { (df['Relevance'] > 0).sum() } items for 'Relevance'.")
+    
+    # 4. Calculate "RelevanceWithoutBeach" score with a keyword modifier
+    logger.info("🚀 Calculating contextual 'RelevanceWithoutBeach' scores...")
+    beach_synonyms = {'beach', 'spiaggia', 'strand', 'plage', 'playa', 'praia'}
+    country_to_beach_map = {'italy': 'spiaggia', 'germany': 'strand', 'spain': 'playa', 'france': 'plage', 'portugal': 'praia'}
+    
+    def beach_keyword_modifier(row):
+        keyword = row['norm_keyword']
+        country = normalize_text(row.get('Country', ''))
+        local_beach_word = country_to_beach_map.get(country, 'beach')
+        
+        # If any beach synonym is in the keyword, replace it with the localized one
+        if any(syn in keyword for syn in beach_synonyms):
+            pattern = r'\b(?:' + '|'.join(beach_synonyms) + r')\b'
+            return re.sub(pattern, local_beach_word, keyword)
+        # Otherwise, append the localized beach word
+        return f"{keyword} {local_beach_word}"
+
+    df['RelevanceWithoutBeach'] = calculate_relevance_scores(df, keyword_modifier_func=beach_keyword_modifier)
+    logger.info(f"✅ Scored { (df['RelevanceWithoutBeach'] > 0).sum() } items for 'RelevanceWithoutBeach'.")
+    
+    # 5. Write results back to Google Sheet
+    write_data_back(worksheet, df, ['Relevance', 'RelevanceWithoutBeach'])
+    
+    logger.info(f"🎉 All tasks completed in {time.time() - total_start_time:.2f}s.")
+
+
+if __name__ == "__main__":
+    main()
